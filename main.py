@@ -1,6 +1,6 @@
 import telebot
 import pytz
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 import threading
 import time as sleep_time
 import logging
@@ -18,9 +18,10 @@ logger = logging.getLogger(__name__)
 
 bot = telebot.TeleBot('7898320721:AAHUS4O-bUMdn4JNT21OTPi4t3oXvBtB1Dk')
 
+
 def init_db():
     with closing(sqlite3.connect(DB_NAME)) as conn:
-        with conn:  # Автоматический commit
+        with conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
@@ -34,8 +35,8 @@ def init_db():
                 )
             """)
 
-# Вызываем при старте
 init_db()
+
 
 def get_user_data(user_id):
     with closing(sqlite3.connect(DB_NAME)) as conn:
@@ -48,7 +49,7 @@ def get_user_data(user_id):
                 'chat_id': row[1],
                 'sleep_time': datetime.strptime(row[2], '%H:%M').time(),
                 'timezone': pytz.timezone(row[3]) if not row[3].startswith('UTC')
-                        else pytz.FixedOffset(int(row[3][3:])*60),
+                else pytz.FixedOffset(int(row[3][3:]) * 60),
                 'streak': row[4],
                 'last_checkin_date': datetime.strptime(row[5], '%Y-%m-%d').date() if row[5] else None,
                 'last_check_date': datetime.strptime(row[6], '%Y-%m-%d').date() if row[6] else None,
@@ -56,9 +57,21 @@ def get_user_data(user_id):
             }
         return None
 
+
 def save_user_data(user_data):
     with closing(sqlite3.connect(DB_NAME)) as conn:
         with conn:
+            tz = user_data['timezone']
+            if isinstance(tz, pytz.tzinfo.BaseTzInfo):
+                if hasattr(tz, 'zone'):
+                    tz_str = tz.zone
+                else:
+                    # Для FixedOffset
+                    offset = tz._utcoffset.seconds // 3600 if tz._utcoffset else 0
+                    tz_str = f"UTC{'+' if offset >=0 else ''}{offset}"
+            else:
+                tz_str = "UTC+0"  # По умолчанию
+
             conn.execute("""
                 INSERT OR REPLACE INTO users 
                 (user_id, chat_id, sleep_time, timezone, streak, last_checkin_date, last_check_date, today_checked)
@@ -67,34 +80,35 @@ def save_user_data(user_data):
                 user_data['user_id'],
                 user_data['chat_id'],
                 user_data['sleep_time'].strftime('%H:%M'),
-                user_data['timezone'].zone if hasattr(user_data['timezone'], 'zone')
-                    else f"UTC{int(user_data['timezone'].utcoffset(None).total_seconds()/3600)}",
+                tz_str,
                 user_data.get('streak', 0),
                 user_data.get('last_checkin_date', '').isoformat() if user_data.get('last_checkin_date') else None,
                 user_data.get('last_check_date', '').isoformat() if user_data.get('last_check_date') else None,
                 int(user_data.get('today_checked', False))
             ))
 
-user_data = {}
-
 
 def format_timezone_name(tz):
     """Форматирует название часового пояса"""
-    if isinstance(tz, pytz._FixedOffset):
-        offset = tz.utcoffset(None).total_seconds() / 3600
-        return f"UTC{'+' if offset >= 0 else ''}{int(offset)}"
-    return tz.zone
+    if isinstance(tz, pytz.tzinfo.BaseTzInfo):
+        if hasattr(tz, 'zone'):
+            return tz.zone
+        else:
+            # Для FixedOffset
+            offset = tz._utcoffset.seconds // 3600 if tz._utcoffset else 0
+            return f"UTC{'+' if offset >=0 else ''}{offset}"
+    return "UTC+0"
 
 
 def reset_streak(user_id, notify=True):
-    user_data = get_user_data(user_id)
-    if user_data:
-        user_data['streak'] = 0
-        user_data['last_checkin_date'] = None
-        save_user_data(user_data)
+    data = get_user_data(user_id)
+    if data:
+        data['streak'] = 0
+        data['last_checkin_date'] = None
+        save_user_data(data)
         if notify:
             bot.send_message(
-                user_data['chat_id'],
+                data['chat_id'],
                 "🔴 Стрик сброшен! Текущий стрик: 0",
                 reply_markup=create_main_menu()
             )
@@ -177,18 +191,20 @@ def confirm_reset(message):
 
 def process_time_step(message):
     try:
-        # Проверяем, не является ли сообщение командой
         if message.text.startswith('/'):
             raise ValueError
 
         sleep_time_obj = datetime.strptime(message.text, "%H:%M").time()
-        user_data[message.from_user.id] = {
-            'sleep_time': sleep_time_obj,
+        user_data = {
+            'user_id': message.from_user.id,
             'chat_id': message.chat.id,
+            'sleep_time': sleep_time_obj,
+            'timezone': pytz.UTC,  # Временное значение, будет обновлено
             'streak': 0,
             'last_checkin_date': None,
             'today_checked': False
         }
+        save_user_data(user_data)
 
         markup = telebot.types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
         timezones = ["UTC+3", "UTC+5", "UTC+6", "UTC+0", "Другой"]
@@ -201,15 +217,12 @@ def process_time_step(message):
             reply_markup=markup
         )
         bot.register_next_step_handler(msg, process_timezone_step)
-
     except ValueError:
-        # Создаем новое сообщение с просьбой ввести время
         msg = bot.send_message(
             message.chat.id,
             "⛔ Неправильный формат. Введи время в формате ЧЧ:ММ (например, 23:45)",
             reply_markup=telebot.types.ReplyKeyboardRemove()
         )
-        # Регистрируем обработчик снова
         bot.register_next_step_handler(msg, process_time_step)
 
 
@@ -217,6 +230,11 @@ def process_timezone_step(message):
     try:
         user_id = message.from_user.id
         tz_text = message.text.strip()
+        data = get_user_data(user_id)
+
+        if not data:
+            show_main_menu(message.chat.id)
+            return
 
         if tz_text == "Другой":
             msg = bot.send_message(
@@ -233,13 +251,14 @@ def process_timezone_step(message):
         else:
             tz = pytz.timezone(tz_text)
 
-        user_data[user_id]['timezone'] = tz
-        user_data[user_id]['last_check_date'] = datetime.now(tz).date()
+        data['timezone'] = tz
+        data['last_check_date'] = datetime.now(tz).date()
+        save_user_data(data)
 
         bot.send_message(
             message.chat.id,
             f"✅ Настройки сохранены!\n"
-            f"Время сна: {user_data[user_id]['sleep_time'].strftime('%H:%M')}\n"
+            f"Время сна: {data['sleep_time'].strftime('%H:%M')}\n"
             f"Часовой пояс: {format_timezone_name(tz)}\n"
             f"Текущий стрик: 0",
             reply_markup=create_main_menu()
@@ -261,6 +280,11 @@ def process_custom_timezone(message):
     try:
         user_id = message.from_user.id
         tz_text = message.text.strip()
+        data = get_user_data(user_id)
+
+        if not data:
+            show_main_menu(message.chat.id)
+            return
 
         if tz_text.startswith("UTC"):
             offset = int(tz_text[3:])
@@ -268,13 +292,14 @@ def process_custom_timezone(message):
         else:
             tz = pytz.timezone(tz_text)
 
-        user_data[user_id]['timezone'] = tz
-        user_data[user_id]['last_check_date'] = datetime.now(tz).date()
+        data['timezone'] = tz
+        data['last_check_date'] = datetime.now(tz).date()
+        save_user_data(data)
 
         bot.send_message(
             message.chat.id,
             f"✅ Настройки сохранены!\n"
-            f"Время сна: {user_data[user_id]['sleep_time'].strftime('%H:%M')}\n"
+            f"Время сна: {data['sleep_time'].strftime('%H:%M')}\n"
             f"Часовой пояс: {format_timezone_name(tz)}\n"
             f"Текущий стрик: 0",
             reply_markup=create_main_menu()
@@ -300,7 +325,9 @@ def show_main_menu(chat_id):
 @bot.message_handler(func=lambda m: m.text == "✅ Отметиться за час до сна")
 def check_in(message):
     user_id = message.from_user.id
-    if user_id not in user_data:
+    data = get_user_data(user_id)
+
+    if not data:
         bot.send_message(
             message.chat.id,
             "Сначала настройте время сна с помощью /start",
@@ -308,21 +335,19 @@ def check_in(message):
         )
         return
 
-    data = user_data[user_id]
     tz = data['timezone']
     now = datetime.now(tz)
     current_time = now.time()
     sleep_time_obj = data['sleep_time']
     today = now.date()
 
-    # Вычисляем время за час до сна
     one_hour_before = (datetime.combine(today, sleep_time_obj) - timedelta(hours=1)).time()
 
-    # Проверяем, что отметились в правильное время
     if one_hour_before <= current_time < sleep_time_obj:
         if data.get('last_checkin_date') != today:
             data['streak'] = data.get('streak', 0) + 1
             data['last_checkin_date'] = today
+            save_user_data(data)
             bot.send_message(
                 message.chat.id,
                 f"✅ Отметка принята! Текущий стрик: {data['streak']}",
@@ -350,8 +375,8 @@ def check_in(message):
 
 @bot.message_handler(func=lambda m: m.text == "📊 Мой стрик")
 def show_streak(message):
-    user_data = get_user_data(message.from_user.id)
-    if not user_data:
+    data = get_user_data(message.from_user.id)
+    if not data:
         bot.send_message(
             message.chat.id,
             "У вас нет активного стрика. Сначала настройте время сна с помощью /start",
@@ -361,9 +386,9 @@ def show_streak(message):
 
     bot.send_message(
         message.chat.id,
-        f"📊 Ваш текущий стрик: {user_data.get('streak', 0)}\n"
-        f"⏰ Время сна: {user_data['sleep_time'].strftime('%H:%M')}\n"
-        f"🌍 Часовой пояс: {format_timezone_name(user_data['timezone'])}",
+        f"📊 Ваш текущий стрик: {data.get('streak', 0)}\n"
+        f"⏰ Время сна: {data['sleep_time'].strftime('%H:%M')}\n"
+        f"🌍 Часовой пояс: {format_timezone_name(data['timezone'])}",
         reply_markup=create_main_menu()
     )
 
@@ -384,9 +409,10 @@ def change_settings(message):
 
 def confirm_settings_change(message):
     if message.text.lower() in ["да", "да, я понимаю"]:
-        # Полностью удаляем данные пользователя
-        if message.from_user.id in user_data:
-            del user_data[message.from_user.id]
+        # Удаляем пользователя из БД
+        with closing(sqlite3.connect(DB_NAME)) as conn:
+            with conn:
+                conn.execute("DELETE FROM users WHERE user_id = ?", (message.from_user.id,))
 
         msg = bot.send_message(
             message.chat.id,
@@ -396,7 +422,7 @@ def confirm_settings_change(message):
         bot.register_next_step_handler(msg, process_time_step)
     else:
         show_main_menu(message.chat.id)
-        return  # Явный возврат для предотвращения продолжения обработки
+
 
 # Запускаем фоновый поток для проверки времени
 threading.Thread(target=check_time_loop, daemon=True).start()
