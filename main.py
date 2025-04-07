@@ -44,18 +44,40 @@ def get_user_data(user_id):
         cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
         row = cursor.fetchone()
         if row:
+            # Проверка и корректировка значений
+            sleep_time_str = row[2] if row[2] else '00:00'  # Если sleep_time пустой
+            timezone_str = row[3] if row[3] else 'UTC+0'    # Если timezone пустой
+            streak = row[4] if row[4] else 0                # Если streak пустой
+
+            # Обработка часового пояса
+            try:
+                if timezone_str.startswith('UTC'):
+                    # Парсим смещение (например, UTC+3)
+                    offset_str = timezone_str[3:]
+                    if offset_str.startswith(('+', '-')):
+                        offset = int(offset_str)
+                    else:
+                        offset = int(f"+{offset_str}")
+                    tz = pytz.FixedOffset(offset * 60)
+                else:
+                    # Пробуем как стандартный часовой пояс
+                    tz = pytz.timezone(timezone_str)
+            except (ValueError, pytz.UnknownTimeZoneError):
+                # Если не удалось распарсить, используем UTC
+                tz = pytz.UTC
+
             return {
                 'user_id': row[0],
                 'chat_id': row[1],
-                'sleep_time': datetime.strptime(row[2], '%H:%M').time(),
-                'timezone': pytz.timezone(row[3]) if not row[3].startswith('UTC')
-                else pytz.FixedOffset(int(row[3][3:]) * 60),
-                'streak': row[4],
+                'sleep_time': datetime.strptime(sleep_time_str, '%H:%M').time(),
+                'timezone': tz,
+                'streak': streak,
                 'last_checkin_date': datetime.strptime(row[5], '%Y-%m-%d').date() if row[5] else None,
                 'last_check_date': datetime.strptime(row[6], '%Y-%m-%d').date() if row[6] else None,
                 'today_checked': bool(row[7])
             }
         return None
+
 
 
 def save_user_data(user_data):
@@ -90,15 +112,14 @@ def save_user_data(user_data):
 
 def format_timezone_name(tz):
     """Форматирует название часового пояса"""
-    if hasattr(tz, '_offset'):
+    if isinstance(tz, pytz._FixedOffset):
         # Для FixedOffset
-        offset = tz.offset.seconds // 3600
+        offset = tz._offset.seconds // 3600
         return f"UTC{'+' if offset >=0 else ''}{offset}"
     elif hasattr(tz, 'zone'):
         # Для стандартных часовых поясов
         return tz.zone
     return "UTC+0"
-
 
 def reset_streak(user_id, notify=True):
     data = get_user_data(user_id)
@@ -127,7 +148,13 @@ def check_time_loop():
                         if not data:
                             continue
 
+                        # Проверка и корректировка часового пояса
                         tz = data['timezone']
+                        if not tz:
+                            tz = pytz.UTC  # Устанавливаем часовой пояс по умолчанию (UTC)
+                            data['timezone'] = tz
+                            save_user_data(data)
+
                         user_now = datetime.now(tz)
                         current_time = user_now.time()
                         sleep_time_obj = data['sleep_time']
@@ -233,11 +260,19 @@ def process_timezone_step(message):
         data = get_user_data(user_id)
 
         if not data:
+            logger.error(f"Данные пользователя {user_id} не найдены.")
             show_main_menu(message.chat.id)
             return
 
+        logger.info(f"Пользователь {user_id} ввёл часовой пояс: {tz_text}")
+
         # Удаляем все пробелы и приводим к верхнему регистру
         tz_text = tz_text.replace(" ", "").upper()
+
+        # Если ввод пустой, устанавливаем значение по умолчанию
+        if not tz_text:
+            tz_text = "UTC+0"
+            logger.info(f"Установлен часовой пояс по умолчанию: {tz_text}")
 
         # Проверяем формат UTC±HH
         if tz_text.startswith("UTC") and len(tz_text) > 3:
@@ -255,6 +290,7 @@ def process_timezone_step(message):
                 data['last_check_date'] = datetime.now(tz).date()
                 save_user_data(data)
 
+                logger.info(f"Часовой пояс успешно сохранён: {format_timezone_name(tz)}")
                 bot.send_message(
                     message.chat.id,
                     f"✅ Настройки сохранены!\n"
@@ -264,8 +300,18 @@ def process_timezone_step(message):
                     reply_markup=create_main_menu()
                 )
                 return
-            except ValueError:
-                pass  # Не удалось распарсить смещение
+            except ValueError as e:
+                logger.error(f"Ошибка парсинга смещения: {e}")
+                bot.send_message(
+                    message.chat.id,
+                    "⛔ Неверный формат смещения. Попробуй еще раз или выбери из списка:",
+                    reply_markup=telebot.types.ReplyKeyboardMarkup(
+                        one_time_keyboard=True,
+                        resize_keyboard=True
+                    ).add(*[telebot.types.KeyboardButton(tz) for tz in ["UTC+3", "UTC+5", "UTC+6", "UTC+0", "Другой"]])
+                )
+                bot.register_next_step_handler(message, process_timezone_step)
+                return
 
         # Если не распознано как UTC±HH, пробуем как стандартный часовой пояс
         try:
@@ -274,6 +320,7 @@ def process_timezone_step(message):
             data['last_check_date'] = datetime.now(tz).date()
             save_user_data(data)
 
+            logger.info(f"Часовой пояс успешно сохранён: {format_timezone_name(tz)}")
             bot.send_message(
                 message.chat.id,
                 f"✅ Настройки сохранены!\n"
@@ -282,8 +329,9 @@ def process_timezone_step(message):
                 f"Текущий стрик: 0",
                 reply_markup=create_main_menu()
             )
-        except pytz.UnknownTimeZoneError:
-            msg = bot.send_message(
+        except pytz.UnknownTimeZoneError as e:
+            logger.error(f"Неизвестный часовой пояс: {tz_text}, ошибка: {e}")
+            bot.send_message(
                 message.chat.id,
                 "⛔ Неверный часовой пояс. Попробуй еще раз или выбери из списка:",
                 reply_markup=telebot.types.ReplyKeyboardMarkup(
@@ -291,14 +339,16 @@ def process_timezone_step(message):
                     resize_keyboard=True
                 ).add(*[telebot.types.KeyboardButton(tz) for tz in ["UTC+3", "UTC+5", "UTC+6", "UTC+0", "Другой"]])
             )
-            bot.register_next_step_handler(msg, process_timezone_step)
+            bot.register_next_step_handler(message, process_timezone_step)
 
     except Exception as e:
-        logger.error(f"Ошибка обработки часового пояса: {e}")
+        logger.error(f"Ошибка обработки часового пояса: {e}", exc_info=True)
         bot.send_message(
             message.chat.id,
             "❌ Произошла ошибка. Попробуйте еще раз (/start)"
         )
+
+
 
 
 def process_custom_timezone(message):
