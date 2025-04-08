@@ -170,9 +170,6 @@ def check_time_loop():
                         sleep_time_obj = data['sleep_time']
                         today = user_now.date()
 
-                        # Логирование для отладки
-                        logger.info(f"Текущее время пользователя {user_id}: {current_time}, время сна: {sleep_time_obj}, часовой пояс: {tz}")
-
                         # Проверка, можно ли отмечаться
                         if (current_time >= sleep_time_obj and
                                 data.get('last_checkin_date') != today and
