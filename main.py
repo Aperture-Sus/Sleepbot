@@ -58,7 +58,12 @@ def get_user_data(user_id):
                         offset = int(offset_str)
                     else:
                         offset = int(f"+{offset_str}")
-                    tz = pytz.FixedOffset(offset * 60)
+
+                    # Используем стандартный часовой пояс с фиксированным смещением
+                    if offset == 0:
+                        tz = pytz.UTC
+                    else:
+                        tz = pytz.timezone(f"Etc/GMT{'+' if offset < 0 else '-'}{abs(offset)}")
                 else:
                     # Пробуем как стандартный часовой пояс
                     tz = pytz.timezone(timezone_str)
@@ -77,6 +82,9 @@ def get_user_data(user_id):
                 'today_checked': bool(row[7])
             }
         return None
+
+
+
 
 
 
@@ -134,7 +142,6 @@ def reset_streak(user_id, notify=True):
                 reply_markup=create_main_menu()
             )
 
-
 def check_time_loop():
     """Фоновая проверка времени для всех пользователей"""
     while True:
@@ -148,18 +155,25 @@ def check_time_loop():
                         if not data:
                             continue
 
-                        # Проверка и корректировка часового пояса
+                        # Получаем часовой пояс пользователя
                         tz = data['timezone']
                         if not tz:
                             tz = pytz.UTC  # Устанавливаем часовой пояс по умолчанию (UTC)
                             data['timezone'] = tz
                             save_user_data(data)
 
+                        # Текущее время пользователя
                         user_now = datetime.now(tz)
                         current_time = user_now.time()
+
+                        # Время сна пользователя
                         sleep_time_obj = data['sleep_time']
                         today = user_now.date()
 
+                        # Логирование для отладки
+                        logger.info(f"Текущее время пользователя {user_id}: {current_time}, время сна: {sleep_time_obj}, часовой пояс: {tz}")
+
+                        # Проверка, можно ли отмечаться
                         if (current_time >= sleep_time_obj and
                                 data.get('last_checkin_date') != today and
                                 not data.get('today_checked', False)):
@@ -180,6 +194,8 @@ def check_time_loop():
         except Exception as e:
             logger.error(f"Ошибка в основном цикле: {e}")
             sleep_time.sleep(10)
+
+
 
 
 def create_main_menu():
@@ -274,7 +290,7 @@ def process_timezone_step(message):
             tz_text = "UTC+0"
             logger.info(f"Установлен часовой пояс по умолчанию: {tz_text}")
 
-        # Проверяем формат UTC±HH
+        # Преобразуем смещение UTC в часовой пояс
         if tz_text.startswith("UTC") and len(tz_text) > 3:
             try:
                 # Парсим смещение (может быть +5 или -5)
@@ -284,8 +300,12 @@ def process_timezone_step(message):
                 else:
                     offset = int(f"+{offset_str}")
 
-                # Создаем часовой пояс с фиксированным смещением
-                tz = pytz.FixedOffset(offset * 60)
+                # Используем стандартный часовой пояс с фиксированным смещением
+                if offset == 0:
+                    tz = pytz.UTC
+                else:
+                    tz = pytz.timezone(f"Etc/GMT{'+' if offset < 0 else '-'}{abs(offset)}")
+
                 data['timezone'] = tz
                 data['last_check_date'] = datetime.now(tz).date()
                 save_user_data(data)
@@ -349,8 +369,6 @@ def process_timezone_step(message):
         )
 
 
-
-
 def process_custom_timezone(message):
     try:
         user_id = message.from_user.id
@@ -410,40 +428,54 @@ def check_in(message):
         )
         return
 
-    tz = data['timezone']
-    now = datetime.now(tz)
-    current_time = now.time()
-    sleep_time_obj = data['sleep_time']
-    today = now.date()
+    try:
+        tz = data['timezone']
+        now = datetime.now(tz)
+        current_time = now.time()
+        sleep_time_obj = data['sleep_time']
+        today = now.date()
 
-    one_hour_before = (datetime.combine(today, sleep_time_obj) - timedelta(hours=1)).time()
+        # Рассчитываем время за час до сна
+        sleep_datetime = datetime.combine(today, sleep_time_obj)
+        one_hour_before = (sleep_datetime - timedelta(hours=1)).time()
+        one_hour_after = (sleep_datetime + timedelta(hours=1)).time()
 
-    if one_hour_before <= current_time < sleep_time_obj:
-        if data.get('last_checkin_date') != today:
-            data['streak'] = data.get('streak', 0) + 1
-            data['last_checkin_date'] = today
-            save_user_data(data)
+        logger.info(f"Текущее время: {current_time}, время сна: {sleep_time_obj}, часовой пояс: {tz}")
+        logger.info(f"Можно отмечаться с {one_hour_before} до {sleep_time_obj}")
+
+        if one_hour_before <= current_time <= sleep_time_obj:
+            if data.get('last_checkin_date') != today:
+                data['streak'] = data.get('streak', 0) + 1
+                data['last_checkin_date'] = today
+                save_user_data(data)
+                bot.send_message(
+                    message.chat.id,
+                    f"✅ Отметка принята! Текущий стрик: {data['streak']}",
+                    reply_markup=create_main_menu()
+                )
+            else:
+                bot.send_message(
+                    message.chat.id,
+                    "Вы уже отметились сегодня. Попробуйте завтра!",
+                    reply_markup=create_main_menu()
+                )
+        elif current_time > sleep_time_obj:
             bot.send_message(
                 message.chat.id,
-                f"✅ Отметка принята! Текущий стрик: {data['streak']}",
+                "⏰ Уже поздно отмечаться! Время сна прошло.",
                 reply_markup=create_main_menu()
             )
         else:
             bot.send_message(
                 message.chat.id,
-                "Вы уже отметились сегодня. Попробуйте завтра!",
+                f"⏳ Слишком рано! Отмечаться можно с {one_hour_before.strftime('%H:%M')} до {sleep_time_obj.strftime('%H:%M')}",
                 reply_markup=create_main_menu()
             )
-    elif current_time >= sleep_time_obj:
+    except Exception as e:
+        logger.error(f"Ошибка при отметке: {e}", exc_info=True)
         bot.send_message(
             message.chat.id,
-            "⏰ Уже поздно отмечаться! Время сна прошло.",
-            reply_markup=create_main_menu()
-        )
-    else:
-        bot.send_message(
-            message.chat.id,
-            f"⏳ Слишком рано! Отмечаться можно за 1 час до сна ({one_hour_before.strftime('%H:%M')}-{sleep_time_obj.strftime('%H:%M')})",
+            "❌ Произошла ошибка при обработке времени. Попробуйте позже.",
             reply_markup=create_main_menu()
         )
 
