@@ -437,7 +437,6 @@ def check_in(message):
         one_hour_before = (sleep_datetime - timedelta(hours=1)).time()
         one_hour_after = (sleep_datetime + timedelta(hours=1)).time()
 
-        logger.info(f"Текущее время: {current_time}, время сна: {sleep_time_obj}, часовой пояс: {tz}")
         logger.info(f"Можно отмечаться с {one_hour_before} до {sleep_time_obj}")
 
         if one_hour_before <= current_time <= sleep_time_obj:
