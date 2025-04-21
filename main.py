@@ -22,6 +22,7 @@ bot = telebot.TeleBot('7898320721:AAHUS4O-bUMdn4JNT21OTPi4t3oXvBtB1Dk')
 def init_db():
     with closing(sqlite3.connect(DB_NAME)) as conn:
         with conn:
+            # Создаем таблицу users, если она не существует
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
@@ -31,12 +32,12 @@ def init_db():
                     streak INTEGER DEFAULT 0,
                     last_checkin_date TEXT,
                     last_check_date TEXT,
-                    today_checked BOOLEAN DEFAULT 0
+                    today_checked BOOLEAN DEFAULT 0,
+                    reminder_sent BOOLEAN DEFAULT 0
                 )
             """)
 
 init_db()
-
 
 def get_user_data(user_id):
     with closing(sqlite3.connect(DB_NAME)) as conn:
@@ -82,11 +83,6 @@ def get_user_data(user_id):
                 'today_checked': bool(row[7])
             }
         return None
-
-
-
-
-
 
 def save_user_data(user_data):
     with closing(sqlite3.connect(DB_NAME)) as conn:
@@ -142,10 +138,68 @@ def reset_streak(user_id, notify=True):
                 reply_markup=create_main_menu()
             )
 
+
+def send_sleep_reminders():
+    """Отправляет напоминания за час до сна"""
+    with closing(sqlite3.connect(DB_NAME)) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM users WHERE reminder_sent = 0")
+        for (user_id,) in cursor.fetchall():
+            try:
+                data = get_user_data(user_id)
+                if not data or data.get('last_checkin_date') == datetime.now(data['timezone']).date():
+                    continue
+
+                tz = data['timezone']
+                now = datetime.now(tz)
+                current_time = now.time()
+                sleep_time_obj = data['sleep_time']
+
+                # Рассчитываем время за час до сна
+                sleep_datetime = datetime.combine(now.date(), sleep_time_obj)
+                one_hour_before = (sleep_datetime - timedelta(hours=1)).time()
+
+                # Точное время напоминания (без окна в 5 минут)
+                if current_time.hour == one_hour_before.hour and current_time.minute == one_hour_before.minute:
+                    bot.send_message(
+                        data['chat_id'],
+                        f"⏰ Напоминание: через час время сна ({sleep_time_obj.strftime('%H:%M')})!\n"
+                        f"Не забудьте отметиться, чтобы сохранить стрик!",
+                        reply_markup=create_main_menu()
+                    )
+
+                    # Немедленно обновляем статус в базе данных
+                    with closing(sqlite3.connect(DB_NAME)) as update_conn:
+                        with update_conn:
+                            update_conn.execute(
+                                "UPDATE users SET reminder_sent = 1 WHERE user_id = ?",
+                                (user_id,)
+                            )
+
+            except Exception as e:
+                logger.error(f"Ошибка отправки напоминания для {user_id}: {e}")
+
 def check_time_loop():
     """Фоновая проверка времени для всех пользователей"""
     while True:
         try:
+            # Проверяем, нужно ли сбросить флаги напоминаний (в начале нового дня)
+            with closing(sqlite3.connect(DB_NAME)) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT user_id FROM users WHERE reminder_sent = 1")
+                for (user_id,) in cursor.fetchall():
+                    data = get_user_data(user_id)
+                    if data and data.get('last_check_date') != datetime.now(data['timezone']).date():
+                        with closing(sqlite3.connect(DB_NAME)) as update_conn:
+                            with update_conn:
+                                update_conn.execute(
+                                    "UPDATE users SET reminder_sent = 0 WHERE user_id = ?",
+                                    (user_id,)
+                                )
+
+            # Отправляем напоминания
+            send_sleep_reminders()
+
             with closing(sqlite3.connect(DB_NAME)) as conn:
                 cursor = conn.cursor()
                 cursor.execute("SELECT user_id FROM users")
@@ -435,7 +489,6 @@ def check_in(message):
         # Рассчитываем время за час до сна
         sleep_datetime = datetime.combine(today, sleep_time_obj)
         one_hour_before = (sleep_datetime - timedelta(hours=1)).time()
-        one_hour_after = (sleep_datetime + timedelta(hours=1)).time()
 
         logger.info(f"Можно отмечаться с {one_hour_before} до {sleep_time_obj}")
 
@@ -443,6 +496,7 @@ def check_in(message):
             if data.get('last_checkin_date') != today:
                 data['streak'] = data.get('streak', 0) + 1
                 data['last_checkin_date'] = today
+                data['reminder_sent'] = True  # Сбрасываем флаг напоминания
                 save_user_data(data)
                 bot.send_message(
                     message.chat.id,
@@ -532,4 +586,5 @@ threading.Thread(target=check_time_loop, daemon=True).start()
 
 if __name__ == '__main__':
     logger.info("Запускаем бота...")
+    init_db()  # Убедитесь, что база данных инициализирована правильно
     bot.polling(none_stop=True)
